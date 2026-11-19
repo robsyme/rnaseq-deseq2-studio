@@ -1,0 +1,6 @@
+.Rproj.user/
+.Rhistory
+.RData
+analysis/*.html
+analysis/*_files/
+analysis/*_cache/

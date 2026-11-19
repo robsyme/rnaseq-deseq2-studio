@@ -1,0 +1,344 @@
+---
+title: "Differential expression with DESeq2"
+subtitle: "nf-core/rnaseq results, four cell lines"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r settings}
+# Folder that holds the nf-core/rnaseq results (the one containing star_salmon/).
+# Leave as NULL to search the mounted data links under data_root.
+data_dir <- NULL
+data_root <- "/workspace/data"
+
+# Comparisons to run. Each is numerator vs denominator, so a positive
+# log2 fold change means higher expression in the numerator cell line.
+contrasts <- list(
+  c(numerator = "K562", denominator = "GM12878"),
+  c(numerator = "MCF7", denominator = "H1")
+)
+
+# Thresholds used to call a gene differentially expressed.
+padj_cutoff <- 0.05
+lfc_cutoff <- 1
+
+# Results tables go to the Studio's own disk, not the read-only data mount.
+results_dir <- "~/results"
+```
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5, dpi = 120)
+```
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(SummarizedExperiment)
+  library(tidyverse)
+  library(ggrepel)
+  library(pheatmap)
+})
+theme_set(theme_bw(base_size = 13))
+```
+
+## Locate the pipeline results
+
+When `data_dir` is not set, the notebook looks through the data links mounted at `/workspace/data`, a few folders deep, for the first folder that contains `star_salmon/`.
+
+```{r locate-data}
+find_rnaseq_outdir <- function(root, max_depth = 4) {
+  level <- root
+  for (depth in 0:max_depth) {
+    hits <- level[dir.exists(file.path(level, "star_salmon"))]
+    if (length(hits) > 0) return(hits[1])
+    level <- unlist(lapply(level, list.dirs, recursive = FALSE, full.names = TRUE))
+    if (length(level) == 0) break
+  }
+  NULL
+}
+
+if (is.null(data_dir)) {
+  data_dir <- find_rnaseq_outdir(data_root)
+  if (is.null(data_dir)) {
+    stop(
+      "No folder containing star_salmon/ was found under ", data_root, ". ",
+      "Mount the data link that holds the nf-core/rnaseq results when you start the Studio, ",
+      "or set data_dir at the top of this notebook to the results folder.",
+      call. = FALSE
+    )
+  }
+}
+quant_dir <- file.path(data_dir, "star_salmon")
+if (!dir.exists(quant_dir)) {
+  stop("data_dir is set to ", data_dir, " but it has no star_salmon/ folder.", call. = FALSE)
+}
+data_dir
+```
+
+## Load gene-level counts
+
+nf-core/rnaseq quantifies each sample with Salmon and merges the results with tximport. The merged gene-level object `salmon.merged.gene.SummarizedExperiment.rds` holds the estimated counts and the average transcript length per gene and sample. DESeq2 uses the lengths as an offset, the same way `DESeqDataSetFromTximport()` does, so that changes in isoform usage between samples are not mistaken for changes in expression. If the `.rds` file is missing, the notebook falls back to the merged TSV tables.
+
+```{r load-counts}
+load_gene_counts <- function(quant_dir) {
+  rds_file <- file.path(quant_dir, "salmon.merged.gene.SummarizedExperiment.rds")
+  if (file.exists(rds_file)) {
+    se <- readRDS(rds_file)
+    length_assay <- intersect(c("lengths", "length"), assayNames(se))[1]
+    row_info <- as.data.frame(rowData(se))
+    gene_name <- if ("gene_name" %in% colnames(row_info)) row_info$gene_name else rownames(se)
+    list(
+      source = rds_file,
+      counts = as.matrix(assay(se, "counts")),
+      lengths = if (is.na(length_assay)) NULL else as.matrix(assay(se, length_assay)),
+      gene_name = setNames(as.character(gene_name), rownames(se))
+    )
+  } else {
+    read_matrix <- function(file) {
+      tbl <- read_tsv(file, show_col_types = FALSE)
+      mat <- as.matrix(select(tbl, -gene_id, -gene_name))
+      rownames(mat) <- tbl$gene_id
+      list(mat = mat, gene_name = setNames(tbl$gene_name, tbl$gene_id))
+    }
+    counts <- read_matrix(file.path(quant_dir, "salmon.merged.gene_counts.tsv"))
+    lengths_file <- file.path(quant_dir, "salmon.merged.gene_lengths.tsv")
+    list(
+      source = file.path(quant_dir, "salmon.merged.gene_counts.tsv"),
+      counts = counts$mat,
+      lengths = if (file.exists(lengths_file)) read_matrix(lengths_file)$mat else NULL,
+      gene_name = counts$gene_name
+    )
+  }
+}
+
+gene_data <- load_gene_counts(quant_dir)
+
+# Genes without a name in the annotation keep their Ensembl ID as a label.
+gene_names <- gene_data$gene_name
+gene_names[is.na(gene_names) | gene_names == ""] <- names(gene_names)[is.na(gene_names) | gene_names == ""]
+
+# Salmon reports estimated counts, which are not whole numbers. DESeq2 needs integers.
+counts <- round(gene_data$counts)
+cat("Loaded", nrow(counts), "genes x", ncol(counts), "samples from", gene_data$source, "\n")
+```
+
+## Samples
+
+Sample names follow the pattern `<cell line>_REP<n>`, so the cell line is everything before `_REP`.
+
+```{r sample-table}
+samples <- tibble(sample = colnames(counts)) %>%
+  mutate(
+    cell_line = factor(sub("_REP[0-9]+$", "", sample)),
+    replicate = sub("^.*_REP", "", sample)
+  )
+
+okabe_ito <- c("#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#0072B2", "#D55E00", "#F0E442", "#000000")
+cell_line_colours <- setNames(okabe_ito[seq_along(levels(samples$cell_line))], levels(samples$cell_line))
+
+knitr::kable(samples)
+```
+
+## Sample QC: library sizes
+
+The number of reads Salmon assigned to genes in each sample. Large differences between replicates of the same cell line would be worth a closer look in the MultiQC report before trusting the comparisons below.
+
+```{r library-sizes, fig.height = 4}
+samples %>%
+  mutate(assigned_reads = colSums(counts)[sample] / 1e6) %>%
+  ggplot(aes(x = sample, y = assigned_reads, fill = cell_line)) +
+  geom_col() +
+  scale_fill_manual(values = cell_line_colours) +
+  labs(x = NULL, y = "Reads assigned to genes (millions)", fill = "Cell line") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Build the DESeq2 dataset
+
+The design `~ cell_line` models expression as a function of cell line. A gene is kept only if it has at least 10 counts in at least as many samples as the smallest group has replicates (two here). Genes below that carry almost no information and only add to the multiple-testing burden.
+
+```{r build-dds}
+sample_info <- as.data.frame(samples)
+rownames(sample_info) <- sample_info$sample
+
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = sample_info, design = ~ cell_line)
+
+tx_lengths <- gene_data$lengths
+if (!is.null(tx_lengths) && all(is.finite(tx_lengths)) && all(tx_lengths > 0)) {
+  assay(dds, "avgTxLength") <- tx_lengths[rownames(dds), colnames(dds)]
+  cat("Using average transcript lengths as a normalisation offset\n")
+} else {
+  cat("Gene lengths not available or not usable; normalising on library size only\n")
+}
+
+smallest_group <- min(table(samples$cell_line))
+keep <- rowSums(counts(dds) >= 10) >= smallest_group
+dds <- dds[keep, ]
+cat("Kept", sum(keep), "of", length(keep), "genes\n")
+```
+
+## Sample similarity: PCA
+
+A variance-stabilising transformation (VST) puts counts on a log2-like scale where variance no longer depends on the mean. Replicates of the same cell line should sit together.
+
+```{r pca, fig.width = 7, fig.height = 5}
+vsd <- vst(dds, blind = TRUE)
+pca_data <- plotPCA(vsd, intgroup = "cell_line", returnData = TRUE)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+
+ggplot(pca_data, aes(PC1, PC2, colour = cell_line, label = name)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3.5, show.legend = FALSE) +
+  scale_colour_manual(values = cell_line_colours) +
+  labs(
+    x = paste0("PC1 (", percent_var[1], "% of variance)"),
+    y = paste0("PC2 (", percent_var[2], "% of variance)"),
+    colour = "Cell line"
+  ) +
+  coord_fixed(ratio = 1)
+```
+
+## Fit the model
+
+`DESeq()` estimates size factors (or, with gene lengths, per-gene normalisation factors), fits a dispersion for each gene and runs the Wald test.
+
+```{r deseq}
+dds <- DESeq(dds)
+plotDispEsts(dds)
+```
+
+## Contrasts
+
+For each comparison the denominator becomes the reference level, so the comparison is a coefficient of the model and can be shrunk with `apeglm`. Shrinkage pulls noisy fold changes from low-count genes towards zero, which makes the fold changes usable for ranking and plotting. The p-values and adjusted p-values come from the unshrunk Wald test.
+
+```{r contrasts}
+run_contrast <- function(dds, numerator, denominator) {
+  unknown <- setdiff(c(numerator, denominator), levels(dds$cell_line))
+  if (length(unknown) > 0) {
+    stop("Unknown cell line: ", paste(unknown, collapse = ", "),
+         ". Choose from: ", paste(levels(dds$cell_line), collapse = ", "), call. = FALSE)
+  }
+  dds$cell_line <- relevel(dds$cell_line, ref = denominator)
+  dds <- nbinomWaldTest(dds, quiet = TRUE)
+  coef_name <- paste("cell_line", numerator, "vs", denominator, sep = "_")
+  unshrunk <- results(dds, name = coef_name, alpha = padj_cutoff)
+  shrunk <- lfcShrink(dds, coef = coef_name, type = "apeglm", res = unshrunk, quiet = TRUE)
+
+  as.data.frame(shrunk) %>%
+    rownames_to_column("gene_id") %>%
+    mutate(
+      gene_name = gene_names[gene_id],
+      significant = !is.na(padj) & padj < padj_cutoff & abs(log2FoldChange) > lfc_cutoff,
+      direction = case_when(
+        significant & log2FoldChange > 0 ~ paste("Up in", numerator),
+        significant & log2FoldChange < 0 ~ paste("Up in", denominator),
+        TRUE ~ "Not significant"
+      )
+    ) %>%
+    relocate(gene_id, gene_name) %>%
+    arrange(padj)
+}
+
+contrast_labels <- map_chr(contrasts, ~ paste(.x["numerator"], "vs", .x["denominator"]))
+de_results <- map(contrasts, ~ run_contrast(dds, .x["numerator"], .x["denominator"])) %>%
+  set_names(contrast_labels)
+
+map2_dfr(de_results, contrasts, function(res, contrast) {
+  tibble(
+    contrast = paste(contrast[["numerator"]], "vs", contrast[["denominator"]]),
+    genes_tested = sum(!is.na(res$padj)),
+    higher_in_numerator = sum(res$significant & res$log2FoldChange > 0),
+    higher_in_denominator = sum(res$significant & res$log2FoldChange < 0)
+  )
+}) %>%
+  knitr::kable()
+```
+
+The tables are written to `results_dir`, one file per comparison.
+
+```{r write-results}
+results_path <- path.expand(results_dir)
+dir.create(results_path, showWarnings = FALSE, recursive = TRUE)
+iwalk(de_results, function(res, label) {
+  out_file <- file.path(results_path, paste0("deseq2_", gsub(" ", "_", label), ".tsv"))
+  write_tsv(select(res, -significant), out_file)
+  cat("Wrote", out_file, "\n")
+})
+```
+
+### Top genes per comparison
+
+```{r top-genes, results = "asis"}
+iwalk(de_results, function(res, label) {
+  cat("\n\n####", label, "\n\n")
+  res %>%
+    filter(significant) %>%
+    head(10) %>%
+    transmute(gene_name, gene_id, baseMean = round(baseMean), log2FoldChange = round(log2FoldChange, 2),
+              padj = formatC(padj, format = "e", digits = 2)) %>%
+    knitr::kable() %>%
+    print()
+})
+```
+
+## Volcano plots
+
+Each point is a gene. The x axis is the shrunken log2 fold change, the y axis is the adjusted p-value on a -log10 scale. Dashed lines mark the thresholds set at the top of the notebook. The 15 genes with the smallest adjusted p-values are labelled. Adjusted p-values below 1e-300 are drawn at 1e-300.
+
+```{r volcano, fig.width = 8, fig.height = 6}
+plot_volcano <- function(res, contrast) {
+  numerator <- contrast[["numerator"]]
+  denominator <- contrast[["denominator"]]
+  plot_data <- res %>%
+    filter(!is.na(padj)) %>%
+    mutate(neg_log10_padj = -log10(pmax(padj, 1e-300)))
+  to_label <- plot_data %>% filter(significant) %>% slice_min(padj, n = 15, with_ties = FALSE)
+  direction_colours <- setNames(
+    c("grey70", "#D55E00", "#0072B2"),
+    c("Not significant", paste("Up in", numerator), paste("Up in", denominator))
+  )
+
+  ggplot(plot_data, aes(log2FoldChange, neg_log10_padj, colour = direction)) +
+    geom_point(size = 1, alpha = 0.6) +
+    geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), linetype = "dashed", colour = "grey40") +
+    geom_hline(yintercept = -log10(padj_cutoff), linetype = "dashed", colour = "grey40") +
+    geom_text_repel(data = to_label, aes(label = gene_name), colour = "black", size = 3.5,
+                    max.overlaps = Inf, min.segment.length = 0) +
+    scale_colour_manual(values = direction_colours) +
+    labs(title = paste(numerator, "vs", denominator), x = "log2 fold change (shrunken)", y = "-log10 adjusted p-value", colour = NULL)
+}
+
+walk2(de_results, contrasts, ~ print(plot_volcano(.x, .y)))
+```
+
+## Heatmap of the most variable genes
+
+The 50 genes with the highest variance across all samples after VST. Values are centred per gene, so colour shows expression above or below that gene's average.
+
+```{r heatmap, fig.width = 9, fig.height = 10}
+top_genes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 50)
+heat <- assay(vsd)[top_genes, ]
+heat <- heat - rowMeans(heat)
+
+pheatmap(
+  heat,
+  labels_row = gene_names[rownames(heat)],
+  annotation_col = data.frame(`Cell line` = vsd$cell_line, row.names = colnames(vsd), check.names = FALSE),
+  annotation_colors = list(`Cell line` = cell_line_colours),
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(101),
+  breaks = seq(-max(abs(heat)), max(abs(heat)), length.out = 102),
+  border_color = NA,
+  cellwidth = 40,
+  cellheight = 11,
+  fontsize_row = 8
+)
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```

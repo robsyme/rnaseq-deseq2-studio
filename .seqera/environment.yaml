@@ -1,0 +1,14 @@
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # Same R as the R-IDE template image, so RStudio keeps working after
+  # Wave copies this environment over the template's /opt/conda.
+  - r-base=4.5.3
+  - bioconductor-deseq2
+  - bioconductor-apeglm
+  - bioconductor-summarizedexperiment
+  - r-tidyverse
+  - r-pheatmap
+  - r-ggrepel
+  - r-rmarkdown
